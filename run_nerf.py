@@ -35,24 +35,44 @@ def batchify(fn, chunk):
 
 
 def run_network(inputs, viewdirs, fn, embed_fn, embeddirs_fn, netchunk=1024*64):
-    """Prepares inputs and applies network 'fn'.
+    """Prepares inputs (P.E 5D input)and applies network 'fn'.
+
+    Args 
+        inputs          : [N_rays, N_samples, 3(x, y, z)]
+        viewdirs        : [N_rays, t_n, t_f, unit-magnitude viewing direction] # FIXME : 정확한 의미
+        fn              : Passing NeRF Network
+        embed_fn        : P.E (x, y, z)
+        embeddirs_fn    : P.E (theta, phi)
+        netchunk        : max (N_rays * N_sample) 1024 * 32
+    
+    function
+        batchify        : concat result with netchunk interval
+
+    Output  
+        (N_rays, N_samples, 4(RGBV) * (N_rays * N_samples) / chunk)
     """
-    inputs_flat = torch.reshape(inputs, [-1, inputs.shape[-1]])
-    embedded = embed_fn(inputs_flat)
+    inputs_flat = torch.reshape(inputs, [-1, inputs.shape[-1]])     # (N_rays * N_samples, 3)
+    embedded = embed_fn(inputs_flat)                                # (N_rays * N_samples, 60 + 3)
 
     if viewdirs is not None:
         input_dirs = viewdirs[:,None].expand(inputs.shape)
         input_dirs_flat = torch.reshape(input_dirs, [-1, input_dirs.shape[-1]])
-        embedded_dirs = embeddirs_fn(input_dirs_flat)
-        embedded = torch.cat([embedded, embedded_dirs], -1)
+        embedded_dirs = embeddirs_fn(input_dirs_flat)               # (N_rays * N_samples, 24 + 2)
+        embedded = torch.cat([embedded, embedded_dirs], -1)         # (N_rays * N_samples, 63 + 26)
 
-    outputs_flat = batchify(fn, netchunk)(embedded)
-    outputs = torch.reshape(outputs_flat, list(inputs.shape[:-1]) + [outputs_flat.shape[-1]])
+    outputs_flat = batchify(fn, netchunk)(embedded)                 #
+    outputs = torch.reshape(outputs_flat, list(inputs.shape[:-1]) + [outputs_flat.shape[-1]]) # (N_rays, N_samples, 4 * (N_rays * N_samples) / chunk)
     return outputs
 
 
 def batchify_rays(rays_flat, chunk=1024*32, **kwargs):
     """Render rays in smaller minibatches to avoid OOM.
+
+    Args
+        rays_flat       : (N_rand, 3(ray_o) + 3(ray_d) + 1(n) + 1(f) + 3(dir))
+
+    function
+        render_rays     : Predict rgb, denstiy of each rays
     """
     all_ret = {}
     for i in range(0, rays_flat.shape[0], chunk):
@@ -114,13 +134,13 @@ def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True,
         rays_o, rays_d = ndc_rays(H, W, K[0][0], 1., rays_o, rays_d)
 
     # Create ray batch
-    rays_o = torch.reshape(rays_o, [-1,3]).float()
-    rays_d = torch.reshape(rays_d, [-1,3]).float()
+    rays_o = torch.reshape(rays_o, [-1,3]).float()      # (N_rand, 3)
+    rays_d = torch.reshape(rays_d, [-1,3]).float()      # (N_rand, 3)
 
-    near, far = near * torch.ones_like(rays_d[...,:1]), far * torch.ones_like(rays_d[...,:1])
-    rays = torch.cat([rays_o, rays_d, near, far], -1)
+    near, far = near * torch.ones_like(rays_d[...,:1]), far * torch.ones_like(rays_d[...,:1]) # (N_rand, 1)
+    rays = torch.cat([rays_o, rays_d, near, far], -1)   
     if use_viewdirs:
-        rays = torch.cat([rays, viewdirs], -1)
+        rays = torch.cat([rays, viewdirs], -1)          # (N_rand, 3 + 3 + 1 + 1 + 3)
 
     # Render and reshape
     all_ret = batchify_rays(rays, chunk, **kwargs)
@@ -177,6 +197,26 @@ def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedi
 
 def create_nerf(args):
     """Instantiate NeRF's MLP model.
+        
+    get_embedder : Positional encoding
+        args.multires       (default) : 10 
+        args.multires_views (default) : 4 
+        args.i_embed        (default) : 0  - set 0 for default positional encoding
+
+        Output 
+            embed_fn    : scalar to vector
+            input_ch    : L = 10 -> 60 + 3(identity input)
+    
+    NeRF : MLP Network
+        args.netdepth       (default) : 8   - MLP depth
+        args.netwidth       (default) : 256 - MLP width
+        output_ch                     : 4   
+            args.N_importance(default) : 0
+        skips                         : [4]
+        input_ch_views                : L = 6 -> 24 + 3
+
+    run_network : 
+        args.netchunk       (default) : 1024 * 32   - number of pts sent through network in parallel
     """
     embed_fn, input_ch = get_embedder(args.multires, args.i_embed)
 
@@ -236,14 +276,14 @@ def create_nerf(args):
 
     render_kwargs_train = {
         'network_query_fn' : network_query_fn,
-        'perturb' : args.perturb,
+        'perturb' : args.perturb,               # (default) 1 - If non-zero, startified sampling
         'N_importance' : args.N_importance,
         'network_fine' : model_fine,
-        'N_samples' : args.N_samples,
+        'N_samples' : args.N_samples,           # (default) 64
         'network_fn' : model,
         'use_viewdirs' : args.use_viewdirs,
         'white_bkgd' : args.white_bkgd,
-        'raw_noise_std' : args.raw_noise_std,
+        'raw_noise_std' : args.raw_noise_std,   # (default) 0.
     }
 
     # NDC only good for LLFF-style forward facing data
@@ -274,7 +314,7 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=F
     """
     raw2alpha = lambda raw, dists, act_fn=F.relu: 1.-torch.exp(-act_fn(raw)*dists)
 
-    dists = z_vals[...,1:] - z_vals[...,:-1]
+    dists = z_vals[...,1:] - z_vals[...,:-1]    # [N_rays, N_samples - 1]
     dists = torch.cat([dists, torch.Tensor([1e10]).expand(dists[...,:1].shape)], -1)  # [N_rays, N_samples]
 
     dists = dists * torch.norm(rays_d[...,None,:], dim=-1)
@@ -289,11 +329,17 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=F
             np.random.seed(0)
             noise = np.random.rand(*list(raw[...,3].shape)) * raw_noise_std
             noise = torch.Tensor(noise)
+    '''
+    alpha = 1 - exp(-density*dists)
+    1 - alpha = exp(-density*dists)
 
-    alpha = raw2alpha(raw[...,3] + noise, dists)  # [N_rays, N_samples]
+    weights = T * (1 - exp(-density*dists))
+    T = exp(-density*dists) * exp(-density*dists) * exp(-density*dists) ...
+    '''
+    alpha = raw2alpha(raw[...,3] + noise, dists)  # [N_rays, N_samples] - Volume density + Noise
     # weights = alpha * tf.math.cumprod(1.-alpha + 1e-10, -1, exclusive=True)
-    weights = alpha * torch.cumprod(torch.cat([torch.ones((alpha.shape[0], 1)), 1.-alpha + 1e-10], -1), -1)[:, :-1]
-    rgb_map = torch.sum(weights[...,None] * rgb, -2)  # [N_rays, 3]
+    weights = alpha * torch.cumprod(torch.cat([torch.ones((alpha.shape[0], 1)), 1.-alpha + 1e-10], -1), -1)[:, :-1] # [N_rays, N_samples] 
+    rgb_map = torch.sum(weights[...,None] * rgb, -2)  # [N_rays, 3] - sum all samples
 
     depth_map = torch.sum(weights * z_vals, -1)
     disp_map = 1./torch.max(1e-10 * torch.ones_like(depth_map), depth_map / torch.sum(weights, -1))
@@ -348,7 +394,7 @@ def render_rays(ray_batch,
       z_std: [num_rays]. Standard deviation of distances along ray for each
         sample.
     """
-    N_rays = ray_batch.shape[0]
+    N_rays = ray_batch.shape[0]         # Sampling ray at one time with OOM 
     rays_o, rays_d = ray_batch[:,0:3], ray_batch[:,3:6] # [N_rays, 3] each
     viewdirs = ray_batch[:,-3:] if ray_batch.shape[-1] > 8 else None
     bounds = torch.reshape(ray_batch[...,6:8], [-1,1,2])
@@ -376,13 +422,13 @@ def render_rays(ray_batch,
             t_rand = np.random.rand(*list(z_vals.shape))
             t_rand = torch.Tensor(t_rand)
 
-        z_vals = lower + (upper - lower) * t_rand
+        z_vals = lower + (upper - lower) * t_rand  # [N_rays, N_samples]
 
-    pts = rays_o[...,None,:] + rays_d[...,None,:] * z_vals[...,:,None] # [N_rays, N_samples, 3]
+    pts = rays_o[...,None,:] + rays_d[...,None,:] * z_vals[...,:,None] # [N_rays, N_samples, 3] - all sample points
 
 
 #     raw = run_network(pts)
-    raw = network_query_fn(pts, viewdirs, network_fn)
+    raw = network_query_fn(pts, viewdirs, network_fn)           # [N_rays, N_samples, RGB + Density]
     rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
 
     if N_importance > 0:
@@ -672,17 +718,17 @@ def train():
             return
 
     # Prepare raybatch tensor if batching random rays
-    N_rand = args.N_rand
-    use_batching = not args.no_batching
+    N_rand = args.N_rand                    # batch size
+    use_batching = not args.no_batching     # True
     if use_batching:
         # For random ray batching
         print('get rays')
-        rays = np.stack([get_rays_np(H, W, K, p) for p in poses[:,:3,:4]], 0) # [N, ro+rd, H, W, 3]
+        rays = np.stack([get_rays_np(H, W, K, p) for p in poses[:,:3,:4]], 0) # [N, ro+rd(2), H, W, 3]
         print('done, concats')
-        rays_rgb = np.concatenate([rays, images[:,None]], 1) # [N, ro+rd+rgb, H, W, 3]
-        rays_rgb = np.transpose(rays_rgb, [0,2,3,1,4]) # [N, H, W, ro+rd+rgb, 3]
+        rays_rgb = np.concatenate([rays, images[:,None]], 1)                  # [N, ro+rd+rgb, H, W, 3]
+        rays_rgb = np.transpose(rays_rgb, [0,2,3,1,4])                        # [N, H, W, ro+rd+rgb, 3]
         rays_rgb = np.stack([rays_rgb[i] for i in i_train], 0) # train images only
-        rays_rgb = np.reshape(rays_rgb, [-1,3,3]) # [(N-1)*H*W, ro+rd+rgb, 3]
+        rays_rgb = np.reshape(rays_rgb, [-1,3,3])                             # [(N-1)*H*W, ro+rd+rgb, 3]
         rays_rgb = rays_rgb.astype(np.float32)
         print('shuffle rays')
         np.random.shuffle(rays_rgb)
@@ -695,7 +741,7 @@ def train():
         images = torch.Tensor(images).to(device)
     poses = torch.Tensor(poses).to(device)
     if use_batching:
-        rays_rgb = torch.Tensor(rays_rgb).to(device)
+        rays_rgb = torch.Tensor(rays_rgb).to(device)    # (N-1)*H*W, ro+rd+rgb, 3
 
 
     N_iters = 200000 + 1
@@ -714,9 +760,9 @@ def train():
         # Sample random ray batch
         if use_batching:
             # Random over all images
-            batch = rays_rgb[i_batch:i_batch+N_rand] # [B, 2+1, 3*?]
-            batch = torch.transpose(batch, 0, 1)
-            batch_rays, target_s = batch[:2], batch[2]
+            batch = rays_rgb[i_batch:i_batch+N_rand]        # [B, 2+1, 3*?]
+            batch = torch.transpose(batch, 0, 1)            # [ro+rd+rgb, B, 3]
+            batch_rays, target_s = batch[:2], batch[2]      # [ro+rd+rgb, B], [3]
 
             i_batch += N_rand
             if i_batch >= rays_rgb.shape[0]:
@@ -730,7 +776,7 @@ def train():
             img_i = np.random.choice(i_train)
             target = images[img_i]
             target = torch.Tensor(target).to(device)
-            pose = poses[img_i, :3,:4]
+            pose = poses[img_i, :3,:4]          # (3, 4)
 
             if N_rand is not None:
                 rays_o, rays_d = get_rays(H, W, K, torch.Tensor(pose))  # (H, W, 3), (H, W, 3)
@@ -748,12 +794,16 @@ def train():
                 else:
                     coords = torch.stack(torch.meshgrid(torch.linspace(0, H-1, H), torch.linspace(0, W-1, W)), -1)  # (H, W, 2)
 
+                '''
+                Random sample in (x, y) -> N_rand
+                rays_d : Origin to Random sample(x, y) dir vectors
+                '''
                 coords = torch.reshape(coords, [-1,2])  # (H * W, 2)
                 select_inds = np.random.choice(coords.shape[0], size=[N_rand], replace=False)  # (N_rand,)
                 select_coords = coords[select_inds].long()  # (N_rand, 2)
                 rays_o = rays_o[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
                 rays_d = rays_d[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
-                batch_rays = torch.stack([rays_o, rays_d], 0)
+                batch_rays = torch.stack([rays_o, rays_d], 0)              # (2, N_rand, 3)
                 target_s = target[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
 
         #####  Core optimization loop  #####

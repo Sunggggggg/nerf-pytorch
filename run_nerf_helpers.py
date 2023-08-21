@@ -13,11 +13,28 @@ to8b = lambda x : (255*np.clip(x,0,1)).astype(np.uint8)
 
 # Positional encoding (section 5.1)
 class Embedder:
+    """
+    create_embedding_fn
+
+    embed(inputs)
+        inputs : x, y, z, theta, phi
+    """
+
     def __init__(self, **kwargs):
         self.kwargs = kwargs
         self.create_embedding_fn()
         
     def create_embedding_fn(self):
+        """
+        kwargs 
+            input_dims      : 3
+            include_input   : True      - Not only P.E to inputs (X, P.E)
+            max_freq_log2   : L - 1
+            num_freqs       : L
+
+            log_sampling    : True
+            periodic_fns    : sin, cos
+        """
         embed_fns = []
         d = self.kwargs['input_dims']
         out_dim = 0
@@ -66,8 +83,6 @@ def get_embedder(multires, i=0):
 # Model
 class NeRF(nn.Module):
     def __init__(self, D=8, W=256, input_ch=3, input_ch_views=3, output_ch=4, skips=[4], use_viewdirs=False):
-        """ 
-        """
         super(NeRF, self).__init__()
         self.D = D
         self.W = W
@@ -94,6 +109,12 @@ class NeRF(nn.Module):
             self.output_linear = nn.Linear(W, output_ch)
 
     def forward(self, x):
+        '''
+        Args
+            x : 5D P.E input (60 + 3, 24 + 2)
+        Output
+            [rgb, alpha] : [3, 1]
+        '''
         input_pts, input_views = torch.split(x, [self.input_ch, self.input_ch_views], dim=-1)
         h = input_pts
         for i, l in enumerate(self.pts_linears):
@@ -151,6 +172,8 @@ class NeRF(nn.Module):
 
 # Ray helpers
 def get_rays(H, W, K, c2w):
+    """ All rays from origin, rays_o, rays_d is dir vectors
+    """
     i, j = torch.meshgrid(torch.linspace(0, W-1, W), torch.linspace(0, H-1, H))  # pytorch's meshgrid has indexing='ij'
     i = i.t()
     j = j.t()
@@ -163,6 +186,8 @@ def get_rays(H, W, K, c2w):
 
 
 def get_rays_np(H, W, K, c2w):
+    """ All rays from origin, rays_o, rays_d is dir vectors
+    """
     i, j = np.meshgrid(np.arange(W, dtype=np.float32), np.arange(H, dtype=np.float32), indexing='xy')
     dirs = np.stack([(i-K[0][2])/K[0][0], -(j-K[1][2])/K[1][1], -np.ones_like(i)], -1)
     # Rotate ray directions from camera frame to the world frame
@@ -196,14 +221,14 @@ def ndc_rays(H, W, focal, near, rays_o, rays_d):
 def sample_pdf(bins, weights, N_samples, det=False, pytest=False):
     # Get pdf
     weights = weights + 1e-5 # prevent nans
-    pdf = weights / torch.sum(weights, -1, keepdim=True)
-    cdf = torch.cumsum(pdf, -1)
-    cdf = torch.cat([torch.zeros_like(cdf[...,:1]), cdf], -1)  # (batch, len(bins))
+    pdf = weights / torch.sum(weights, -1, keepdim=True)        # (batch, len(bins))
+    cdf = torch.cumsum(pdf, -1)                                 # (batch, len(bins))
+    cdf = torch.cat([torch.zeros_like(cdf[...,:1]), cdf], -1)   # (batch, len(bins) + 1)
 
     # Take uniform samples
     if det:
-        u = torch.linspace(0., 1., steps=N_samples)
-        u = u.expand(list(cdf.shape[:-1]) + [N_samples])
+        u = torch.linspace(0., 1., steps=N_samples)             # (N_samples)
+        u = u.expand(list(cdf.shape[:-1]) + [N_samples])        # (batch, N_samples)
     else:
         u = torch.rand(list(cdf.shape[:-1]) + [N_samples])
 
@@ -227,9 +252,9 @@ def sample_pdf(bins, weights, N_samples, det=False, pytest=False):
 
     # cdf_g = tf.gather(cdf, inds_g, axis=-1, batch_dims=len(inds_g.shape)-2)
     # bins_g = tf.gather(bins, inds_g, axis=-1, batch_dims=len(inds_g.shape)-2)
-    matched_shape = [inds_g.shape[0], inds_g.shape[1], cdf.shape[-1]]
-    cdf_g = torch.gather(cdf.unsqueeze(1).expand(matched_shape), 2, inds_g)
-    bins_g = torch.gather(bins.unsqueeze(1).expand(matched_shape), 2, inds_g)
+    matched_shape = [inds_g.shape[0], inds_g.shape[1], cdf.shape[-1]]           # (batch, N_samples, len(bins) + 1)
+    cdf_g = torch.gather(cdf.unsqueeze(1).expand(matched_shape), 2, inds_g)     # (batch, N_samples, 2)
+    bins_g = torch.gather(bins.unsqueeze(1).expand(matched_shape), 2, inds_g)   # (batch, N_samples, 2)
 
     denom = (cdf_g[...,1]-cdf_g[...,0])
     denom = torch.where(denom<1e-5, torch.ones_like(denom), denom)
